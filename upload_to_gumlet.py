@@ -47,6 +47,7 @@ import logging
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -190,7 +191,9 @@ class GumletClient:
         if tags:
             body["tag"] = tags
         if metadata:
-            body["metadata"] = json.dumps(metadata)
+            # Gumlet rejects a JSON-encoded string ("body/metadata must be
+            # object"), so send the dict directly.
+            body["metadata"] = metadata
         if resolutions:
             body["resolution"] = resolutions
         r = self.s.post(
@@ -203,14 +206,48 @@ class GumletClient:
         return r.json()
 
     def put_file(self, upload_url: str, path: Path, content_type: str) -> None:
+        # Use a bare request (no session) so the Bearer auth header isn't
+        # sent to the pre-signed S3 URL, which rejects "Only one auth
+        # mechanism allowed".
         with path.open("rb") as fh:
-            r = self.s.put(
+            r = requests.put(
                 upload_url,
                 data=fh,
                 headers={"Content-Type": content_type},
                 timeout=None,
             )
         r.raise_for_status()
+
+    # --- asset status -----------------------------------------------------
+
+    def get_asset(self, asset_id: str) -> dict[str, Any]:
+        r = self.s.get(f"{API_BASE}/video/assets/{asset_id}", timeout=60)
+        r.raise_for_status()
+        return r.json()
+
+    def wait_until_ready(
+        self,
+        asset_id: str,
+        *,
+        timeout_s: float = 900,
+        poll_interval_s: float = 5,
+    ) -> dict[str, Any]:
+        """Poll GET /video/assets/{id} until status in {ready, errored}."""
+        deadline = time.monotonic() + timeout_s
+        last_status = None
+        while time.monotonic() < deadline:
+            asset = self.get_asset(asset_id)
+            status = asset.get("status")
+            if status != last_status:
+                log.info("    status=%s progress=%s",
+                         status, asset.get("progress"))
+                last_status = status
+            if status in ("ready", "errored", "failed"):
+                return asset
+            time.sleep(poll_interval_s)
+        raise TimeoutError(
+            f"asset {asset_id} not ready after {timeout_s:.0f}s"
+        )
 
     # --- thumbnail --------------------------------------------------------
 
@@ -273,7 +310,7 @@ def _subtitle_upload_url_for(
         if "upload_url" in payload:
             candidates = [payload]
         else:
-            for key in ("subtitles", "uploads", "results"):
+            for key in ("signed_urls", "subtitles", "uploads", "results"):
                 if key in payload and isinstance(payload[key], list):
                     candidates = [p for p in payload[key] if isinstance(p, dict)]
                     break
@@ -312,6 +349,18 @@ def upload_folder(client: GumletClient, vf: VideoFolder, dry_run: bool = False) 
     upload_url = asset["upload_url"]
     log.info("  asset_id = %s", asset_id)
     client.put_file(upload_url, vf.source, "video/mp4")
+
+    # Thumbnail and subtitle uploads only work once Gumlet has transcoded
+    # the video and the asset is in the "ready" state.
+    if vf.thumbnail is not None or vf.subtitles:
+        log.info("  waiting for asset to become ready...")
+        final = client.wait_until_ready(asset_id)
+        if final.get("status") != "ready":
+            log.error("  asset did not become ready (status=%s); "
+                      "skipping thumbnail+subtitles",
+                      final.get("status"))
+            return {"asset_id": asset_id, "video_id": vf.video_id,
+                    "status": final.get("status")}
 
     # 2. thumbnail
     if vf.thumbnail is not None:
