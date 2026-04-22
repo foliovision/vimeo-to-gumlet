@@ -32,18 +32,33 @@ The uploader picks the source file like this:
 
 ## Uploader usage
 
+Requires Python 3.9+. On macOS, `pip` is not on `PATH` by default —
+use `python3 -m pip` (or `pip3`).
+
 ```bash
-pip install -r requirements.txt
+python3 -m pip install -r requirements.txt
 
 export GUMLET_API_KEY=...          # Bearer token
 export GUMLET_COLLECTION_ID=...    # workspace id
 export GUMLET_PARENT_ID=...        # (optional) destination folder id
 
 # Dry run — shows what would be uploaded, makes no HTTP calls:
-python3 upload_to_gumlet.py --root /home/ubuntu/fv-videos --dry-run -v
+python3 upload_to_gumlet.py --root ./videos --dry-run -v
 
 # Real run:
-python3 upload_to_gumlet.py --root /home/ubuntu/fv-videos -v
+python3 upload_to_gumlet.py --root ./videos -v
+```
+
+### Using a virtualenv (recommended on macOS)
+
+The system Python on macOS is managed by Apple and `pip install` into it
+may fail with "externally-managed-environment". Use a venv:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -r requirements.txt
+python3 upload_to_gumlet.py --root ./videos --dry-run -v
 ```
 
 For each folder the script:
