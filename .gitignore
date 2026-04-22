@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.env.*
+# Generated sample media (regenerate with ./generate_samples.sh)
+[0-9]* */
