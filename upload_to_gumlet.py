@@ -22,16 +22,22 @@ For each folder we:
         POST /v1/video/assets/{asset_id}/subtitle/upload
              body: {"language_codes": ["<lang>"]}
         Response returns an upload URL per language; PUT the VTT file to it.
+    5.  (optional) After uploads, move the assets into a target folder via
+        POST /v1/video/workspaces/{workspace_id}/folders/{folder_id}
+             body: {"asset_ids": [...]}
 
 Authentication:
     Requires GUMLET_API_KEY in the environment.
-    Requires GUMLET_COLLECTION_ID (a.k.a. source_id / workspace_id) unless
+    Requires GUMLET_COLLECTION_ID (a.k.a. workspace_id) unless
     passed via --collection-id.
+    Optionally --parent-id / GUMLET_PARENT_ID to place the uploaded assets
+    in a specific folder inside that workspace.
 
 Docs:
     https://docs.gumlet.com/reference/create-asset-direct-upload
     https://docs.gumlet.com/reference/select-from-image-file
     https://docs.gumlet.com/reference/video-asset-upload-subtitle
+    https://docs.gumlet.com/reference/update-folder
 """
 from __future__ import annotations
 
@@ -232,6 +238,24 @@ class GumletClient:
         # or a list of such objects. Caller must handle both.
         return r.json()
 
+    # --- folder placement -------------------------------------------------
+
+    def move_to_folder(
+        self, workspace_id: str, folder_id: str, asset_ids: list[str]
+    ) -> dict[str, Any]:
+        """Move one or more assets into a specific folder.
+
+        Docs: https://docs.gumlet.com/reference/update-folder
+        """
+        r = self.s.post(
+            f"{API_BASE}/video/workspaces/{workspace_id}/folders/{folder_id}",
+            headers={"Content-Type": "application/json"},
+            json={"asset_ids": asset_ids},
+            timeout=60,
+        )
+        r.raise_for_status()
+        return r.json() if r.content else {}
+
 
 # ---------- per-folder orchestration --------------------------------------
 
@@ -323,7 +347,11 @@ def main() -> int:
                    help="Gumlet API key (env: GUMLET_API_KEY)")
     p.add_argument("--collection-id",
                    default=os.environ.get("GUMLET_COLLECTION_ID", ""),
-                   help="Gumlet collection/workspace id (env: GUMLET_COLLECTION_ID)")
+                   help="Gumlet workspace id (env: GUMLET_COLLECTION_ID)")
+    p.add_argument("--parent-id",
+                   default=os.environ.get("GUMLET_PARENT_ID", ""),
+                   help="Gumlet folder id to place assets into "
+                        "(env: GUMLET_PARENT_ID). Optional.")
     p.add_argument("--dry-run", action="store_true",
                    help="List what would be uploaded but make no API calls")
     p.add_argument("-v", "--verbose", action="store_true")
@@ -357,6 +385,21 @@ def main() -> int:
                       vf.name, exc, getattr(exc.response, "text", ""))
         except Exception as exc:
             log.exception("  failed for %s: %s", vf.name, exc)
+
+    # Move uploaded assets into the requested folder in one call.
+    if not args.dry_run and args.parent_id:
+        asset_ids = [r["asset_id"] for r in results if r.get("asset_id")]
+        if asset_ids:
+            try:
+                client.move_to_folder(
+                    args.collection_id, args.parent_id, asset_ids,
+                )
+                log.info("moved %d asset(s) into folder %s",
+                         len(asset_ids), args.parent_id)
+            except requests.HTTPError as exc:
+                log.error("failed to move assets into folder %s: %s — %s",
+                          args.parent_id, exc,
+                          getattr(exc.response, "text", ""))
 
     print(json.dumps(results, indent=2))
     return 0

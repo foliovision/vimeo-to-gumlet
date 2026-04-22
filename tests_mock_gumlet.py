@@ -20,7 +20,12 @@ UPLOADS: dict[str, dict] = {}
 ASSET_RE = re.compile(r"^/v1/video/assets/upload/?$")
 THUMB_RE = re.compile(r"^/v1/video/assets/(?P<id>[^/]+)/thumbnail/?$")
 SUB_RE = re.compile(r"^/v1/video/assets/(?P<id>[^/]+)/subtitle/upload/?$")
+FOLDER_RE = re.compile(
+    r"^/v1/video/workspaces/(?P<ws>[^/]+)/folders/(?P<fid>[^/]+)/?$"
+)
 PUT_RE = re.compile(r"^/put/(?P<tok>[^/]+)/?$")
+
+FOLDER_MOVES: list[dict] = []
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -78,6 +83,18 @@ class Handler(BaseHTTPRequestHandler):
                 })
             # Match "single object" shape when only one language requested.
             return self._json(200, out[0] if len(out) == 1 else {"subtitles": out})
+
+        m = FOLDER_RE.match(self.path)
+        if m:
+            FOLDER_MOVES.append({
+                "workspace_id": m.group("ws"),
+                "folder_id": m.group("fid"),
+                "asset_ids": body.get("asset_ids", []),
+            })
+            return self._json(200, {
+                "folder_id": m.group("fid"),
+                "asset_ids": body.get("asset_ids", []),
+            })
 
         return self._json(404, {"error": f"unknown path {self.path}"})
 

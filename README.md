@@ -33,10 +33,11 @@ The uploader picks the source file like this:
 ## Uploader usage
 
 ```bash
-pip install requests
+pip install -r requirements.txt
 
 export GUMLET_API_KEY=...          # Bearer token
-export GUMLET_COLLECTION_ID=...    # workspace / source / collection id
+export GUMLET_COLLECTION_ID=...    # workspace id
+export GUMLET_PARENT_ID=...        # (optional) destination folder id
 
 # Dry run — shows what would be uploaded, makes no HTTP calls:
 python3 upload_to_gumlet.py --root /home/ubuntu/fv-videos --dry-run -v
@@ -55,6 +56,10 @@ For each folder the script:
    `POST /v1/video/assets/{asset_id}/subtitle/upload`
      body `{"language_codes": ["<lang>"]}`
    then `PUT` the VTT to the returned URL.
+4. If `--parent-id` / `GUMLET_PARENT_ID` is set, all newly-created assets
+   are moved into that folder at the end via
+   `POST /v1/video/workspaces/{workspace_id}/folders/{folder_id}`
+     body `{"asset_ids": [...]}` — a single call for the whole batch.
 
 The folder's `video-details.json` is attached as `metadata` / `description`
 on the asset, and `fv-video-id:{id}` is added as a tag.
