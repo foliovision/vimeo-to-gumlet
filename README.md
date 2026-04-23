@@ -45,18 +45,25 @@ export GUMLET_PARENT_ID=...        # (optional) destination folder id
 # Dry run — shows what would be uploaded, makes no HTTP calls:
 python3 upload_to_gumlet.py --root ./videos --dry-run -v
 
-# Real run:
+# Real run (writes ./manifest.json by default):
 python3 upload_to_gumlet.py --root ./videos -v
 
-# Real run + write a JSON manifest of fv video_id -> Gumlet URLs:
-python3 upload_to_gumlet.py --root ./videos -v --output-json manifest.json
+# Same, with a custom manifest path:
+python3 upload_to_gumlet.py --root ./videos -v --output-json /path/to/manifest.json
 ```
 
 ### JSON manifest (`--output-json`)
 
-After the uploads (and optional folder move) finish, the script re-fetches
-each newly-created asset via `GET /v1/video/assets/{id}` and writes an array
-of entries to the path passed to `--output-json`:
+The script **always** maintains a JSON manifest file (default
+`./manifest.json`, overridable with `--output-json`). On startup it is
+read; any folder whose `fv_video_id` is already in the file is skipped
+(no duplicate upload). After the uploads (and optional folder move)
+finish, each newly-created asset is fetched via
+`GET /v1/video/assets/{id}` and merged back into the file by
+`fv_video_id` (new ids are appended, existing ids are replaced with the
+latest URLs). Unrelated entries are preserved untouched.
+
+Each entry has the shape:
 
 ```json
 [

@@ -319,6 +319,55 @@ def _dedup_subtitles(tracks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return list(by_lang.values())
 
 
+def load_manifest(path: Path) -> list[dict[str, Any]]:
+    """Read an existing manifest from disk; return [] if missing/empty/unreadable."""
+    if not path.exists():
+        return []
+    try:
+        raw = path.read_text()
+        if not raw.strip():
+            return []
+        data = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as exc:
+        log.warning("could not parse existing manifest %s: %s — starting fresh",
+                    path, exc)
+        return []
+    if not isinstance(data, list):
+        log.warning("manifest %s is not a JSON array (got %s); starting fresh",
+                    path, type(data).__name__)
+        return []
+    return data
+
+
+def merge_manifest(
+    existing: list[dict[str, Any]],
+    new_entries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Merge `new_entries` into `existing` keyed by fv_video_id.
+
+    - Entries in `existing` whose fv_video_id matches a new entry are replaced.
+    - Entries in `existing` not in `new_entries` are kept untouched.
+    - Preserves the original order of `existing`; appends brand-new ids at
+      the end in the order they were uploaded.
+    """
+    by_id = {e.get("fv_video_id"): e for e in new_entries if e.get("fv_video_id")}
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for e in existing:
+        vid = e.get("fv_video_id")
+        if vid in by_id:
+            out.append(by_id[vid])
+            seen.add(vid)
+        else:
+            out.append(e)
+    for e in new_entries:
+        vid = e.get("fv_video_id")
+        if vid and vid not in seen:
+            out.append(e)
+            seen.add(vid)
+    return out
+
+
 def build_manifest_entry(
     vf: VideoFolder, asset: dict[str, Any]
 ) -> dict[str, Any]:
@@ -484,10 +533,11 @@ def main() -> int:
                         "(env: GUMLET_PARENT_ID). Optional.")
     p.add_argument("--dry-run", action="store_true",
                    help="List what would be uploaded but make no API calls")
-    p.add_argument("--output-json", metavar="PATH",
-                   help="Write a JSON manifest mapping FV video_id to the "
-                        "resulting Gumlet URLs (playback, thumbnail, preview "
-                        "thumbnails, subtitle VTTs) after upload")
+    p.add_argument("--output-json", metavar="PATH", default="manifest.json",
+                   help="Path to the JSON manifest (default: ./manifest.json). "
+                        "The file is read on startup; any FV video_id already "
+                        "present is skipped during upload, and new/updated "
+                        "entries are merged back in.")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
 
@@ -509,9 +559,26 @@ def main() -> int:
             log.error("GUMLET_COLLECTION_ID is required (or --collection-id)")
             return 2
 
-    client = None if args.dry_run else GumletClient(args.api_key, args.collection_id)
-    results = []
+    # Load existing manifest so we can skip already-uploaded videos and
+    # merge new/updated entries back in.
+    manifest_path = Path(args.output_json)
+    existing: list[dict[str, Any]] = load_manifest(manifest_path)
+    already_uploaded = {
+        e.get("fv_video_id"): e for e in existing if e.get("fv_video_id")
+    }
+
+    todo: list[VideoFolder] = []
     for vf in folders:
+        if vf.video_id in already_uploaded:
+            log.info("skip %s (%s): already in %s as asset_id=%s",
+                     vf.name, vf.video_id, manifest_path,
+                     already_uploaded[vf.video_id].get("asset_id"))
+            continue
+        todo.append(vf)
+
+    client = None if args.dry_run else GumletClient(args.api_key, args.collection_id)
+    results: list[dict[str, Any]] = []
+    for vf in todo:
         try:
             results.append(upload_folder(client, vf, dry_run=args.dry_run))
         except requests.HTTPError as exc:
@@ -535,12 +602,12 @@ def main() -> int:
                           args.parent_id, exc,
                           getattr(exc.response, "text", ""))
 
-    # Build the video_id -> Gumlet URLs manifest.
-    manifest: list[dict[str, Any]] = []
+    # Build the video_id -> Gumlet URLs entries for newly uploaded assets.
+    new_entries: list[dict[str, Any]] = []
     if not args.dry_run:
         vf_by_asset_id = {
             r["asset_id"]: vf
-            for r, vf in zip(results, folders)
+            for r, vf in zip(results, todo)
             if r.get("asset_id")
         }
         for asset_id, vf in vf_by_asset_id.items():
@@ -550,15 +617,16 @@ def main() -> int:
                 log.error("manifest: failed to fetch asset %s: %s — %s",
                           asset_id, exc, getattr(exc.response, "text", ""))
                 continue
-            manifest.append(build_manifest_entry(vf, asset))
+            new_entries.append(build_manifest_entry(vf, asset))
 
-    if args.output_json and manifest:
-        out_path = Path(args.output_json)
-        out_path.write_text(json.dumps(manifest, indent=2))
-        log.info("wrote manifest for %d asset(s) to %s",
-                 len(manifest), out_path)
+    merged = merge_manifest(existing, new_entries)
+    if not args.dry_run:
+        manifest_path.write_text(json.dumps(merged, indent=2))
+        log.info("wrote manifest with %d total entr%s (%d new) to %s",
+                 len(merged), "y" if len(merged) == 1 else "ies",
+                 len(new_entries), manifest_path)
 
-    print(json.dumps(manifest or results, indent=2))
+    print(json.dumps(new_entries or results, indent=2))
     return 0
 
 
