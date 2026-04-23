@@ -781,6 +781,13 @@ def main() -> int:
                  entry.get("fv_video_id"))
 
     # Move newly uploaded assets into the requested folder in one call.
+    # TODO: --parent-id / GUMLET_PARENT_ID currently only applies to assets
+    # uploaded during this run. If every folder is already in the manifest
+    # (skipped by idempotency), new_asset_ids is empty and the folder move
+    # never fires, so changing GUMLET_PARENT_ID on a repeat run has no
+    # effect. Fix: also move already-known asset_ids (from the loaded
+    # manifest) when --parent-id is supplied, or record the current parent
+    # in the manifest entry and re-move whenever it changes.
     if not args.dry_run and args.parent_id and new_asset_ids:
         try:
             client.move_to_folder(
