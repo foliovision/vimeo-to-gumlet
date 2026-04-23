@@ -230,7 +230,7 @@ class GumletClient:
         asset_id: str,
         *,
         timeout_s: float = 900,
-        poll_interval_s: float = 5,
+        poll_interval_s: float = 15,
     ) -> dict[str, Any]:
         """Poll GET /video/assets/{id} until status in {ready, errored}."""
         deadline = time.monotonic() + timeout_s
@@ -577,56 +577,64 @@ def main() -> int:
         todo.append(vf)
 
     client = None if args.dry_run else GumletClient(args.api_key, args.collection_id)
-    results: list[dict[str, Any]] = []
+    manifest: list[dict[str, Any]] = list(existing)
+    new_asset_ids: list[str] = []
+    new_entries: list[dict[str, Any]] = []
+
+    def _flush_manifest() -> None:
+        if args.dry_run:
+            return
+        tmp = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
+        tmp.write_text(json.dumps(manifest, indent=2))
+        tmp.replace(manifest_path)
+
     for vf in todo:
         try:
-            results.append(upload_folder(client, vf, dry_run=args.dry_run))
+            r = upload_folder(client, vf, dry_run=args.dry_run)
         except requests.HTTPError as exc:
             log.error("  HTTP error for %s: %s — %s",
                       vf.name, exc, getattr(exc.response, "text", ""))
+            continue
         except Exception as exc:
             log.exception("  failed for %s: %s", vf.name, exc)
+            continue
 
-    # Move uploaded assets into the requested folder in one call.
-    if not args.dry_run and args.parent_id:
-        asset_ids = [r["asset_id"] for r in results if r.get("asset_id")]
-        if asset_ids:
-            try:
-                client.move_to_folder(
-                    args.collection_id, args.parent_id, asset_ids,
-                )
-                log.info("moved %d asset(s) into folder %s",
-                         len(asset_ids), args.parent_id)
-            except requests.HTTPError as exc:
-                log.error("failed to move assets into folder %s: %s — %s",
-                          args.parent_id, exc,
-                          getattr(exc.response, "text", ""))
+        asset_id = r.get("asset_id")
+        if args.dry_run or not asset_id:
+            continue
 
-    # Build the video_id -> Gumlet URLs entries for newly uploaded assets.
-    new_entries: list[dict[str, Any]] = []
-    if not args.dry_run:
-        vf_by_asset_id = {
-            r["asset_id"]: vf
-            for r, vf in zip(results, todo)
-            if r.get("asset_id")
-        }
-        for asset_id, vf in vf_by_asset_id.items():
-            try:
-                asset = client.get_asset(asset_id)
-            except requests.HTTPError as exc:
-                log.error("manifest: failed to fetch asset %s: %s — %s",
-                          asset_id, exc, getattr(exc.response, "text", ""))
-                continue
-            new_entries.append(build_manifest_entry(vf, asset))
+        new_asset_ids.append(asset_id)
+        try:
+            asset = client.get_asset(asset_id)
+        except requests.HTTPError as exc:
+            log.error("manifest: failed to fetch asset %s: %s — %s",
+                      asset_id, exc, getattr(exc.response, "text", ""))
+            continue
 
-    merged = merge_manifest(existing, new_entries)
-    if not args.dry_run:
-        manifest_path.write_text(json.dumps(merged, indent=2))
-        log.info("wrote manifest with %d total entr%s (%d new) to %s",
-                 len(merged), "y" if len(merged) == 1 else "ies",
-                 len(new_entries), manifest_path)
+        entry = build_manifest_entry(vf, asset)
+        manifest = merge_manifest(manifest, [entry])
+        new_entries.append(entry)
+        _flush_manifest()
+        log.info("  manifest updated (%d total entr%s) for fv_video_id=%s",
+                 len(manifest), "y" if len(manifest) == 1 else "ies",
+                 entry.get("fv_video_id"))
 
-    print(json.dumps(new_entries or results, indent=2))
+    # Move newly uploaded assets into the requested folder in one call.
+    if not args.dry_run and args.parent_id and new_asset_ids:
+        try:
+            client.move_to_folder(
+                args.collection_id, args.parent_id, new_asset_ids,
+            )
+            log.info("moved %d asset(s) into folder %s",
+                     len(new_asset_ids), args.parent_id)
+        except requests.HTTPError as exc:
+            log.error("failed to move assets into folder %s: %s — %s",
+                      args.parent_id, exc,
+                      getattr(exc.response, "text", ""))
+
+    log.info("manifest at %s: %d entries (%d new this run)",
+             manifest_path, len(manifest), len(new_entries))
+    print(json.dumps(new_entries or [], indent=2))
     return 0
 
 
