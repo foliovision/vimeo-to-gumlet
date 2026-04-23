@@ -98,11 +98,11 @@ see:
 | `thumbnail-*.png` | ✓ | always public |
 | `preview_thumbnails.vtt` | ✓ | timeline-preview sprite map |
 | `main.m3u8` | ✗ (401) | HLS master is token-protected by default |
-| `subtitles-<lang>.vtt` / `.m3u8` | ✗ (403) | delivered via the HLS master, same protection |
+| `<asset_id>_<idx>_<lang>_v<n>.vtt` | ✓ | the actual VTT Gumlet serves for the language |
 | `...-transcription-word-level-timestamp.json` | ✓ (signed) | pre-signed URL with `?token=&expires=` |
 
-To make `main.m3u8` / subtitle URLs directly fetchable without a token, turn
-off **Security → Secure Token** for the workspace, or use Gumlet's signed-URL
+To make `main.m3u8` directly fetchable without a token, turn off
+**Security → Secure Token** for the workspace, or use Gumlet's signed-URL
 helper in your player.
 
 ### Using a virtualenv (recommended on macOS)
@@ -126,8 +126,16 @@ For each folder the script:
 3. For every `subtitles-{lang}-{label}.vtt.vtt`:
    `POST /v1/video/assets/{asset_id}/subtitle/upload`
      body `{"language_codes": ["<lang>"]}`
-   then `PUT` the VTT to the returned URL.
-4. If `--parent-id` / `GUMLET_PARENT_ID` is set, all newly-created assets
+   then `PUT` the VTT to the returned URL. Files are processed in
+   lexicographic order, so when multiple VTTs exist for the same
+   language the one starting with `Updated …` wins.
+4. Once all VTTs are uploaded:
+   `POST /v1/video/assets/{asset_id}/subtitle/upload/event`
+     body `{"upload_responses": [{"language_code": "<lang>", "uploaded": true}, …]}`
+   This is the handshake that actually triggers Gumlet's subtitle
+   transcoding — without it the subtitles sit in `input.additional_tracks`
+   forever but never appear in the dashboard or the HLS manifest.
+5. If `--parent-id` / `GUMLET_PARENT_ID` is set, all newly-created assets
    are moved into that folder at the end via
    `POST /v1/video/workspaces/{workspace_id}/folders/{folder_id}`
      body `{"asset_ids": [...]}` — a single call for the whole batch.

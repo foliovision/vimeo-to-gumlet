@@ -249,6 +249,42 @@ class GumletClient:
             f"asset {asset_id} not ready after {timeout_s:.0f}s"
         )
 
+    def wait_for_subtitles(
+        self,
+        asset_id: str,
+        expected_langs: list[str],
+        *,
+        timeout_s: float = 300,
+        poll_interval_s: float = 15,
+    ) -> dict[str, Any]:
+        """Poll until every expected language appears in
+        output.storage_details.subtitle. Returns the final asset payload.
+
+        Gumlet's subtitle transcode runs asynchronously after the
+        completion POST; the asset `status` stays `ready` throughout, so
+        we instead poll the storage_details array directly.
+        """
+        want = {l.lower() for l in expected_langs}
+        deadline = time.monotonic() + timeout_s
+        asset: dict[str, Any] = {}
+        while time.monotonic() < deadline:
+            asset = self.get_asset(asset_id)
+            subs = (asset.get("output") or {}).get("storage_details", {}).get(
+                "subtitle", []
+            ) or []
+            have: set[str] = set()
+            for item in subs:
+                m = _SUBTITLE_FILE_RE.match(item.get("fileName", ""))
+                if m:
+                    have.add(m.group("lang").lower())
+            if want <= have:
+                return asset
+            time.sleep(poll_interval_s)
+        log.warning("    subtitles not all present after %.0fs "
+                    "(expected %s, got %s)",
+                    timeout_s, sorted(want), sorted(have))
+        return asset
+
     # --- thumbnail --------------------------------------------------------
 
     def request_thumbnail_upload(self, asset_id: str) -> dict[str, Any]:
@@ -274,6 +310,25 @@ class GumletClient:
         # Response shape varies; can be {upload_url: ..., language_code: "en"}
         # or a list of such objects. Caller must handle both.
         return r.json()
+
+    def complete_subtitle_upload(
+        self, asset_id: str, upload_responses: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Notify Gumlet that subtitle uploads finished so it triggers
+        transcoding & HLS packaging. Without this call the VTTs sit in
+        `input.additional_tracks` forever but never appear in the dashboard
+        or in `output.storage_details.subtitle`.
+
+        Docs: https://docs.gumlet.com/reference/upload-subtitle-completion
+        """
+        r = self.s.post(
+            f"{API_BASE}/video/assets/{asset_id}/subtitle/upload/event",
+            headers={"Content-Type": "application/json"},
+            json={"upload_responses": upload_responses},
+            timeout=60,
+        )
+        r.raise_for_status()
+        return r.json() if r.content else {}
 
     # --- folder placement -------------------------------------------------
 
@@ -368,6 +423,11 @@ def merge_manifest(
     return out
 
 
+_SUBTITLE_FILE_RE = re.compile(
+    r"^(?P<aid>.+)_(?P<idx>\d+)_(?P<lang>[A-Za-z0-9-]+)_v\d+\.vtt$"
+)
+
+
 def build_manifest_entry(
     vf: VideoFolder, asset: dict[str, Any]
 ) -> dict[str, Any]:
@@ -385,24 +445,30 @@ def build_manifest_entry(
         else None
     )
 
-    subtitles = []
-    for sub in _dedup_subtitles(asset.get("input", {}).get("additional_tracks", [])):
-        entry = {
-            "language_code": sub["language_code"],
-            "name": sub.get("name"),
-        }
-        if cdn_base:
-            # Convention: Gumlet serves each subtitle as
-            #   <cdn_base>/subtitles-<lang>.vtt
-            # and as a per-language HLS playlist
-            #   <cdn_base>/subtitles-<lang>.m3u8
-            # Actual reachability depends on the workspace's security
-            # settings (token auth / referer restrictions).
-            entry["vtt_url"] = f"{cdn_base}/subtitles-{sub['language_code']}.vtt"
-            entry["hls_playlist_url"] = (
-                f"{cdn_base}/subtitles-{sub['language_code']}.m3u8"
-            )
-        subtitles.append(entry)
+    # Map language_code -> human-readable name, deduped across duplicate
+    # entries that additional_tracks accumulates on every upload.
+    names_by_lang: dict[str, str | None] = {}
+    for t in asset.get("input", {}).get("additional_tracks", []) or []:
+        if t.get("type") != "subtitle":
+            continue
+        lang = t.get("language_code")
+        if lang:
+            names_by_lang[lang] = t.get("name") or names_by_lang.get(lang)
+
+    # Authoritative list: what Gumlet has actually transcoded & will serve.
+    # The filename pattern is "{asset_id}_{index}_{lang}_v{version}.vtt".
+    subtitles: list[dict[str, Any]] = []
+    for item in output.get("storage_details", {}).get("subtitle", []) or []:
+        fname = item.get("fileName", "")
+        m = _SUBTITLE_FILE_RE.match(fname)
+        if not m:
+            continue
+        lang = m.group("lang").lower()
+        subtitles.append({
+            "language_code": lang,
+            "name": names_by_lang.get(lang),
+            "vtt_url": f"{cdn_base}/{fname}" if cdn_base else None,
+        })
 
     return {
         "fv_video_id": vf.video_id,
@@ -498,19 +564,52 @@ def upload_folder(
         client.put_file(thumb["upload_url"], vf.thumbnail, "image/jpeg")
         log.info("  thumbnail uploaded")
 
-    # 3. subtitles — one POST per VTT so each file gets its own upload URL
-    for sub in vf.subtitles:
+    # 3. subtitles — one POST per VTT so each file gets its own upload URL.
+    #    Gumlet only keeps one track per language, so uploading multiple VTTs
+    #    for the same language overwrites (sorted lexicographically, so
+    #    "Updated ..." wins over the plain name). We track per-language
+    #    success and then fire a SINGLE completion POST — without that call
+    #    Gumlet never actually transcodes the uploads.
+    subtitle_status: dict[str, bool] = {}
+    for sub in sorted(vf.subtitles, key=lambda p: p.name):
         m = SUBTITLE_RE.match(sub.name)
         if m is None:
             continue
         lang = m.group("lang").lower()
-        resp = client.request_subtitle_upload(asset_id, [lang])
-        put_url = _subtitle_upload_url_for(resp, lang)
-        if put_url is None:
-            log.warning("  no upload_url for subtitle %s (response: %r)", sub.name, resp)
+        try:
+            resp = client.request_subtitle_upload(asset_id, [lang])
+            put_url = _subtitle_upload_url_for(resp, lang)
+            if put_url is None:
+                log.warning("  no upload_url for subtitle %s (response: %r)",
+                            sub.name, resp)
+                subtitle_status.setdefault(lang, False)
+                continue
+            client.put_file(put_url, sub, "text/vtt")
+        except requests.HTTPError as exc:
+            log.error("  subtitle %s upload failed: %s — %s", sub.name, exc,
+                      getattr(exc.response, "text", ""))
+            subtitle_status[lang] = False
             continue
-        client.put_file(put_url, sub, "text/vtt")
+        subtitle_status[lang] = True
         log.info("  subtitle %s (%s) uploaded", lang, sub.name)
+
+    if subtitle_status:
+        # Required follow-up POST that actually triggers subtitle transcoding.
+        payload = [
+            {"language_code": lang, "uploaded": ok}
+            for lang, ok in subtitle_status.items()
+        ]
+        try:
+            client.complete_subtitle_upload(asset_id, payload)
+            ok_langs = [l for l, ok in subtitle_status.items() if ok]
+            log.info("  subtitle completion notified (%s)",
+                     ", ".join(ok_langs) or "none")
+            if ok_langs:
+                log.info("  waiting for subtitles to transcode...")
+                client.wait_for_subtitles(asset_id, ok_langs)
+        except requests.HTTPError as exc:
+            log.error("  subtitle completion failed: %s — %s", exc,
+                      getattr(exc.response, "text", ""))
 
     return {"asset_id": asset_id, "video_id": vf.video_id}
 

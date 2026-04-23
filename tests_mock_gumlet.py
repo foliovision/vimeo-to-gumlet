@@ -21,6 +21,9 @@ ASSET_RE = re.compile(r"^/v1/video/assets/upload/?$")
 ASSET_GET_RE = re.compile(r"^/v1/video/assets/(?P<id>[^/]+)/?$")
 THUMB_RE = re.compile(r"^/v1/video/assets/(?P<id>[^/]+)/thumbnail/?$")
 SUB_RE = re.compile(r"^/v1/video/assets/(?P<id>[^/]+)/subtitle/upload/?$")
+SUB_EVENT_RE = re.compile(
+    r"^/v1/video/assets/(?P<id>[^/]+)/subtitle/upload/event/?$"
+)
 FOLDER_RE = re.compile(
     r"^/v1/video/workspaces/(?P<ws>[^/]+)/folders/(?P<fid>[^/]+)/?$"
 )
@@ -55,6 +58,7 @@ def _ready_asset(aid: str, subtitle_langs: list[str] | None = None) -> dict:
             "playback_url": f"{base}/main.m3u8",
             "thumbnail_url": [f"{base}/thumbnail-1-0.png?v=0"],
             "preview_thumbnails_url": f"{base}/preview_thumbnails.vtt",
+            "storage_details": {"subtitle": []},
         },
     }
 
@@ -97,6 +101,20 @@ class Handler(BaseHTTPRequestHandler):
                 "upload_url": f"{base}/put/{tok}",
                 "asset_id": m.group("id"),
             })
+
+        m = SUB_EVENT_RE.match(self.path)
+        if m:
+            aid = m.group("id")
+            asset = ASSETS.setdefault(aid, _ready_asset(aid))
+            subs = asset["output"]["storage_details"].setdefault("subtitle", [])
+            for idx, ur in enumerate(body.get("upload_responses") or []):
+                if not ur.get("uploaded"):
+                    continue
+                lang = ur.get("language_code")
+                fname = f"{aid}_{idx}_{lang}_v1.vtt"
+                if not any(s["fileName"] == fname for s in subs):
+                    subs.append({"fileName": fname, "size": 1234})
+            return self._json(200, {})
 
         m = SUB_RE.match(self.path)
         if m:
