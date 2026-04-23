@@ -731,9 +731,23 @@ def main() -> int:
     todo: list[VideoFolder] = []
     for vf in folders:
         if vf.video_id in already_uploaded:
-            log.info("skip %s (%s): already in %s as asset_id=%s",
-                     vf.name, vf.video_id, manifest_path,
-                     already_uploaded[vf.video_id].get("asset_id"))
+            prev_asset_id = already_uploaded[vf.video_id].get("asset_id")
+            if args.dry_run:
+                # In dry-run we want the full per-video block so it's obvious
+                # at a glance which folders will be skipped vs uploaded.
+                log.info("== %s (%s) == [SKIP: already in %s as asset_id=%s]",
+                         vf.name, vf.video_id, manifest_path, prev_asset_id)
+                log.info("  source:    %s (%d bytes)",
+                         vf.source.name, vf.source.stat().st_size)
+                if vf.thumbnail:
+                    log.info("  thumbnail: %s", vf.thumbnail.name)
+                chosen_subs, _ = pick_subtitles(vf.subtitles)
+                for lang, sub in sorted(chosen_subs.items()):
+                    log.info("  subtitle %s: %s (%d bytes)",
+                             lang, sub.name, sub.stat().st_size)
+            else:
+                log.info("skip %s (%s): already in %s as asset_id=%s",
+                         vf.name, vf.video_id, manifest_path, prev_asset_id)
             continue
         todo.append(vf)
 
