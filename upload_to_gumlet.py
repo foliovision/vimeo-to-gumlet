@@ -564,18 +564,37 @@ def upload_folder(
         client.put_file(thumb["upload_url"], vf.thumbnail, "image/jpeg")
         log.info("  thumbnail uploaded")
 
-    # 3. subtitles — one POST per VTT so each file gets its own upload URL.
-    #    Gumlet only keeps one track per language, so uploading multiple VTTs
-    #    for the same language overwrites (sorted lexicographically, so
-    #    "Updated ..." wins over the plain name). We track per-language
-    #    success and then fire a SINGLE completion POST — without that call
-    #    Gumlet never actually transcodes the uploads.
-    subtitle_status: dict[str, bool] = {}
-    for sub in sorted(vf.subtitles, key=lambda p: p.name):
+    # 3. subtitles.
+    #    Gumlet keeps exactly one track per language_code, so when the FV
+    #    folder contains multiple VTTs for the same language (e.g. both a
+    #    `captions` and a `subtitles` track from Vimeo) we upload only the
+    #    BIGGEST file per language — larger typically means the full
+    #    closed-caption track (dialog + sound effects) rather than a
+    #    dialog-only subtitle.
+    by_lang: dict[str, Path] = {}
+    for sub in vf.subtitles:
         m = SUBTITLE_RE.match(sub.name)
         if m is None:
             continue
         lang = m.group("lang").lower()
+        current = by_lang.get(lang)
+        if current is None or sub.stat().st_size > current.stat().st_size:
+            by_lang[lang] = sub
+
+    for lang, dropped in (
+        (l, [p for p in vf.subtitles
+             if SUBTITLE_RE.match(p.name)
+             and SUBTITLE_RE.match(p.name).group("lang").lower() == l
+             and p != by_lang[l]])
+        for l in by_lang
+    ):
+        for d in dropped:
+            log.info("  skipping %s (%d bytes) — keeping larger %s (%d bytes) for %s",
+                     d.name, d.stat().st_size,
+                     by_lang[lang].name, by_lang[lang].stat().st_size, lang)
+
+    subtitle_status: dict[str, bool] = {}
+    for lang, sub in sorted(by_lang.items()):
         try:
             resp = client.request_subtitle_upload(asset_id, [lang])
             put_url = _subtitle_upload_url_for(resp, lang)
