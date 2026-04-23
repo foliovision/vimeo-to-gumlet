@@ -515,6 +515,29 @@ def _subtitle_upload_url_for(
     return None
 
 
+def pick_subtitles(subtitles: list[Path]) -> tuple[dict[str, Path], dict[str, list[Path]]]:
+    """For each BCP47 language_code, pick the largest VTT file on disk.
+
+    Returns (chosen, dropped) where chosen maps lang -> winning Path, and
+    dropped maps lang -> Paths skipped because a bigger file won.
+    """
+    by_lang: dict[str, list[Path]] = {}
+    for sub in subtitles:
+        m = SUBTITLE_RE.match(sub.name)
+        if m is None:
+            continue
+        by_lang.setdefault(m.group("lang").lower(), []).append(sub)
+
+    chosen: dict[str, Path] = {}
+    dropped: dict[str, list[Path]] = {}
+    for lang, files in by_lang.items():
+        files_sorted = sorted(files, key=lambda p: p.stat().st_size, reverse=True)
+        chosen[lang] = files_sorted[0]
+        if len(files_sorted) > 1:
+            dropped[lang] = files_sorted[1:]
+    return chosen, dropped
+
+
 def upload_folder(
     client: GumletClient | None,
     vf: VideoFolder,
@@ -524,8 +547,17 @@ def upload_folder(
     log.info("  source:    %s (%d bytes)", vf.source.name, vf.source.stat().st_size)
     if vf.thumbnail:
         log.info("  thumbnail: %s", vf.thumbnail.name)
-    for s in vf.subtitles:
-        log.info("  subtitle:  %s", s.name)
+
+    # Gumlet keeps one track per language_code, so when the FV folder
+    # contains multiple VTTs for the same language (e.g. Vimeo 'captions'
+    # + 'subtitles') we upload only the BIGGEST file per language.
+    chosen_subs, dropped_subs = pick_subtitles(vf.subtitles)
+    for lang, sub in sorted(chosen_subs.items()):
+        log.info("  subtitle %s: %s (%d bytes)",
+                 lang, sub.name, sub.stat().st_size)
+        for d in dropped_subs.get(lang, []):
+            log.info("    skipping %s (%d bytes) — smaller than chosen file for %s",
+                     d.name, d.stat().st_size, lang)
 
     if dry_run:
         return {"dry_run": True, "video_id": vf.video_id}
@@ -564,37 +596,9 @@ def upload_folder(
         client.put_file(thumb["upload_url"], vf.thumbnail, "image/jpeg")
         log.info("  thumbnail uploaded")
 
-    # 3. subtitles.
-    #    Gumlet keeps exactly one track per language_code, so when the FV
-    #    folder contains multiple VTTs for the same language (e.g. both a
-    #    `captions` and a `subtitles` track from Vimeo) we upload only the
-    #    BIGGEST file per language — larger typically means the full
-    #    closed-caption track (dialog + sound effects) rather than a
-    #    dialog-only subtitle.
-    by_lang: dict[str, Path] = {}
-    for sub in vf.subtitles:
-        m = SUBTITLE_RE.match(sub.name)
-        if m is None:
-            continue
-        lang = m.group("lang").lower()
-        current = by_lang.get(lang)
-        if current is None or sub.stat().st_size > current.stat().st_size:
-            by_lang[lang] = sub
-
-    for lang, dropped in (
-        (l, [p for p in vf.subtitles
-             if SUBTITLE_RE.match(p.name)
-             and SUBTITLE_RE.match(p.name).group("lang").lower() == l
-             and p != by_lang[l]])
-        for l in by_lang
-    ):
-        for d in dropped:
-            log.info("  skipping %s (%d bytes) — keeping larger %s (%d bytes) for %s",
-                     d.name, d.stat().st_size,
-                     by_lang[lang].name, by_lang[lang].stat().st_size, lang)
-
+    # 3. subtitles — one per language, picked above by pick_subtitles().
     subtitle_status: dict[str, bool] = {}
-    for lang, sub in sorted(by_lang.items()):
+    for lang, sub in sorted(chosen_subs.items()):
         try:
             resp = client.request_subtitle_upload(asset_id, [lang])
             put_url = _subtitle_upload_url_for(resp, lang)
