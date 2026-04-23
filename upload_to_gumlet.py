@@ -83,17 +83,44 @@ class VideoFolder:
 # ---------- folder discovery ----------------------------------------------
 
 
-def _pick_source(folder: Path) -> Path | None:
-    """Prefer *-source.mp4 if present and non-empty; else highest -{N}p.mp4."""
-    for f in folder.iterdir():
-        if SOURCE_RE.search(f.name) and f.is_file() and f.stat().st_size > 0:
-            return f
+def _pick_source(
+    folder: Path, rendition: str | None = None
+) -> Path | None:
+    """Pick a source MP4 for the asset.
 
+    If `rendition` is given (e.g. "360p" or "360"), find the smallest
+    available rendition whose resolution is >= that target and return it.
+    Otherwise: prefer *-source.mp4 if present and non-empty, falling back
+    to the highest-resolution -{N}p.mp4.
+    """
     renditions: list[tuple[int, Path]] = []
     for f in folder.iterdir():
         m = RENDITION_RE.search(f.name)
         if m and f.is_file() and f.stat().st_size > 0:
             renditions.append((int(m.group("res")), f))
+
+    if rendition is not None:
+        m = re.match(r"^(\d{3,4})p?$", rendition.strip(), re.IGNORECASE)
+        if not m:
+            raise ValueError(
+                f"invalid --rendition {rendition!r}; "
+                "expected e.g. '360p' or '720'"
+            )
+        target = int(m.group(1))
+        renditions.sort(key=lambda t: t[0])
+        for res, path in renditions:
+            if res >= target:
+                return path
+        if renditions:
+            # Nothing >= target; fall back to the biggest available and
+            # let the caller log a warning.
+            return renditions[-1][1]
+        return None
+
+    for f in folder.iterdir():
+        if SOURCE_RE.search(f.name) and f.is_file() and f.stat().st_size > 0:
+            return f
+
     if not renditions:
         return None
     renditions.sort(key=lambda t: t[0], reverse=True)
@@ -131,7 +158,9 @@ def _load_details(folder: Path) -> dict[str, Any]:
         return {}
 
 
-def discover_folders(root: Path) -> list[VideoFolder]:
+def discover_folders(
+    root: Path, rendition: str | None = None
+) -> list[VideoFolder]:
     result: list[VideoFolder] = []
     for entry in sorted(root.iterdir()):
         if not entry.is_dir():
@@ -140,7 +169,7 @@ def discover_folders(root: Path) -> list[VideoFolder]:
         if not m:
             log.debug("Skipping %s (does not match '{id} {name}')", entry.name)
             continue
-        source = _pick_source(entry)
+        source = _pick_source(entry, rendition=rendition)
         if source is None:
             log.warning("%s has no usable source video, skipping", entry.name)
             continue
@@ -655,6 +684,12 @@ def main() -> int:
                         "(env: GUMLET_PARENT_ID). Optional.")
     p.add_argument("--dry-run", action="store_true",
                    help="List what would be uploaded but make no API calls")
+    p.add_argument("--rendition", metavar="NNNp",
+                   help="Upload a specific -{N}p.mp4 rendition instead of "
+                        "-source.mp4. Useful for fast testing (e.g. "
+                        "--rendition 360p uploads the 360p rendition). "
+                        "If the exact resolution is absent, the smallest "
+                        "rendition at or above the target is used.")
     p.add_argument("--output-json", metavar="PATH", default="manifest.json",
                    help="Path to the JSON manifest (default: ./manifest.json). "
                         "The file is read on startup; any FV video_id already "
@@ -668,7 +703,11 @@ def main() -> int:
         format="%(levelname)s %(message)s",
     )
 
-    folders = discover_folders(Path(args.root))
+    try:
+        folders = discover_folders(Path(args.root), rendition=args.rendition)
+    except ValueError as exc:
+        log.error("%s", exc)
+        return 2
     if not folders:
         log.error("No matching folders found under %s", args.root)
         return 1
