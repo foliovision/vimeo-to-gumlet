@@ -54,7 +54,7 @@ from typing import Any
 
 import requests
 
-API_BASE = "https://api.gumlet.com/v1"
+API_BASE = os.environ.get("GUMLET_API_BASE_URL", "https://api.gumlet.com/v1")
 
 RENDITION_RE = re.compile(r"-(?P<res>\d{3,4})p\.mp4$", re.IGNORECASE)
 SOURCE_RE = re.compile(r"-source\.mp4$", re.IGNORECASE)
@@ -294,6 +294,83 @@ class GumletClient:
         return r.json() if r.content else {}
 
 
+# ---------- manifest assembly ---------------------------------------------
+
+
+def _dedup_subtitles(tracks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return one entry per language_code from asset.input.additional_tracks.
+
+    Gumlet appends a record every time a subtitle is (re-)uploaded, even
+    when the same language already exists, so we collapse by `language_code`
+    (keeping the last one, which is the most recent upload).
+    """
+    by_lang: dict[str, dict[str, Any]] = {}
+    for t in tracks or []:
+        if t.get("type") != "subtitle":
+            continue
+        lang = t.get("language_code")
+        if not lang:
+            continue
+        by_lang[lang] = {
+            "language_code": lang,
+            "name": t.get("name"),
+            "storage_path": t.get("url"),
+        }
+    return list(by_lang.values())
+
+
+def build_manifest_entry(
+    vf: VideoFolder, asset: dict[str, Any]
+) -> dict[str, Any]:
+    """Cherry-pick playable URLs from a ready asset for the output JSON."""
+    asset_id = asset.get("asset_id") or asset.get("id")
+    output = asset.get("output") or {}
+    workspace_id = (
+        asset.get("workspace_id")
+        or asset.get("source_id")
+        or asset.get("collection_id")
+    )
+    cdn_base = (
+        f"https://video.gumlet.io/{workspace_id}/{asset_id}"
+        if workspace_id and asset_id
+        else None
+    )
+
+    subtitles = []
+    for sub in _dedup_subtitles(asset.get("input", {}).get("additional_tracks", [])):
+        entry = {
+            "language_code": sub["language_code"],
+            "name": sub.get("name"),
+        }
+        if cdn_base:
+            # Convention: Gumlet serves each subtitle as
+            #   <cdn_base>/subtitles-<lang>.vtt
+            # and as a per-language HLS playlist
+            #   <cdn_base>/subtitles-<lang>.m3u8
+            # Actual reachability depends on the workspace's security
+            # settings (token auth / referer restrictions).
+            entry["vtt_url"] = f"{cdn_base}/subtitles-{sub['language_code']}.vtt"
+            entry["hls_playlist_url"] = (
+                f"{cdn_base}/subtitles-{sub['language_code']}.m3u8"
+            )
+        subtitles.append(entry)
+
+    return {
+        "fv_video_id": vf.video_id,
+        "title": vf.name,
+        "asset_id": asset_id,
+        "status": asset.get("status"),
+        "playback_url": output.get("playback_url"),
+        "dash_playback_url": (
+            output.get("dash_playback_url") or asset.get("dash_playback_url")
+        ),
+        "thumbnail_urls": output.get("thumbnail_url") or [],
+        "preview_thumbnails_url": output.get("preview_thumbnails_url"),
+        "transcription_url": output.get("transcription_word_level_timestamps"),
+        "subtitles": subtitles,
+    }
+
+
 # ---------- per-folder orchestration --------------------------------------
 
 
@@ -323,7 +400,11 @@ def _subtitle_upload_url_for(
     return None
 
 
-def upload_folder(client: GumletClient, vf: VideoFolder, dry_run: bool = False) -> dict[str, Any]:
+def upload_folder(
+    client: GumletClient | None,
+    vf: VideoFolder,
+    dry_run: bool = False,
+) -> dict[str, Any]:
     log.info("== %s (%s) ==", vf.name, vf.video_id)
     log.info("  source:    %s (%d bytes)", vf.source.name, vf.source.stat().st_size)
     if vf.thumbnail:
@@ -403,6 +484,10 @@ def main() -> int:
                         "(env: GUMLET_PARENT_ID). Optional.")
     p.add_argument("--dry-run", action="store_true",
                    help="List what would be uploaded but make no API calls")
+    p.add_argument("--output-json", metavar="PATH",
+                   help="Write a JSON manifest mapping FV video_id to the "
+                        "resulting Gumlet URLs (playback, thumbnail, preview "
+                        "thumbnails, subtitle VTTs) after upload")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
 
@@ -450,7 +535,30 @@ def main() -> int:
                           args.parent_id, exc,
                           getattr(exc.response, "text", ""))
 
-    print(json.dumps(results, indent=2))
+    # Build the video_id -> Gumlet URLs manifest.
+    manifest: list[dict[str, Any]] = []
+    if not args.dry_run:
+        vf_by_asset_id = {
+            r["asset_id"]: vf
+            for r, vf in zip(results, folders)
+            if r.get("asset_id")
+        }
+        for asset_id, vf in vf_by_asset_id.items():
+            try:
+                asset = client.get_asset(asset_id)
+            except requests.HTTPError as exc:
+                log.error("manifest: failed to fetch asset %s: %s — %s",
+                          asset_id, exc, getattr(exc.response, "text", ""))
+                continue
+            manifest.append(build_manifest_entry(vf, asset))
+
+    if args.output_json and manifest:
+        out_path = Path(args.output_json)
+        out_path.write_text(json.dumps(manifest, indent=2))
+        log.info("wrote manifest for %d asset(s) to %s",
+                 len(manifest), out_path)
+
+    print(json.dumps(manifest or results, indent=2))
     return 0
 
 

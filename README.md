@@ -47,7 +47,56 @@ python3 upload_to_gumlet.py --root ./videos --dry-run -v
 
 # Real run:
 python3 upload_to_gumlet.py --root ./videos -v
+
+# Real run + write a JSON manifest of fv video_id -> Gumlet URLs:
+python3 upload_to_gumlet.py --root ./videos -v --output-json manifest.json
 ```
+
+### JSON manifest (`--output-json`)
+
+After the uploads (and optional folder move) finish, the script re-fetches
+each newly-created asset via `GET /v1/video/assets/{id}` and writes an array
+of entries to the path passed to `--output-json`:
+
+```json
+[
+  {
+    "fv_video_id": "196881410",
+    "title": "Foliovision Promo Video",
+    "asset_id": "69e8d9c08dd5a216e299e96c",
+    "status": "ready",
+    "playback_url": "https://video.gumlet.io/<ws>/<asset>/main.m3u8",
+    "dash_playback_url": null,
+    "thumbnail_urls": ["https://video.gumlet.io/<ws>/<asset>/thumbnail-1-0.png?v=..."],
+    "preview_thumbnails_url": "https://video.gumlet.io/<ws>/<asset>/preview_thumbnails.vtt",
+    "transcription_url": "https://video.gumlet.io/<ws>/<asset>/<asset>-transcription-word-level-timestamp.json?token=...",
+    "subtitles": [
+      {
+        "language_code": "en",
+        "name": "English",
+        "vtt_url": "https://video.gumlet.io/<ws>/<asset>/subtitles-en.vtt",
+        "hls_playlist_url": "https://video.gumlet.io/<ws>/<asset>/subtitles-en.m3u8"
+      }
+    ]
+  }
+]
+```
+
+Reachability of the URLs depends on the workspace's security settings in
+the Gumlet dashboard. In a freshly-provisioned workspace you will typically
+see:
+
+| URL | Default public | Notes |
+|---|---|---|
+| `thumbnail-*.png` | ✓ | always public |
+| `preview_thumbnails.vtt` | ✓ | timeline-preview sprite map |
+| `main.m3u8` | ✗ (401) | HLS master is token-protected by default |
+| `subtitles-<lang>.vtt` / `.m3u8` | ✗ (403) | delivered via the HLS master, same protection |
+| `...-transcription-word-level-timestamp.json` | ✓ (signed) | pre-signed URL with `?token=&expires=` |
+
+To make `main.m3u8` / subtitle URLs directly fetchable without a token, turn
+off **Security → Secure Token** for the workspace, or use Gumlet's signed-URL
+helper in your player.
 
 ### Using a virtualenv (recommended on macOS)
 

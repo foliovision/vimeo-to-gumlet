@@ -18,6 +18,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 UPLOADS: dict[str, dict] = {}
 
 ASSET_RE = re.compile(r"^/v1/video/assets/upload/?$")
+ASSET_GET_RE = re.compile(r"^/v1/video/assets/(?P<id>[^/]+)/?$")
 THUMB_RE = re.compile(r"^/v1/video/assets/(?P<id>[^/]+)/thumbnail/?$")
 SUB_RE = re.compile(r"^/v1/video/assets/(?P<id>[^/]+)/subtitle/upload/?$")
 FOLDER_RE = re.compile(
@@ -26,6 +27,36 @@ FOLDER_RE = re.compile(
 PUT_RE = re.compile(r"^/put/(?P<tok>[^/]+)/?$")
 
 FOLDER_MOVES: list[dict] = []
+ASSETS: dict[str, dict] = {}
+
+WORKSPACE_ID = "ws_mock"
+
+
+def _ready_asset(aid: str, subtitle_langs: list[str] | None = None) -> dict:
+    base = f"https://video.gumlet.io/{WORKSPACE_ID}/{aid}"
+    return {
+        "asset_id": aid,
+        "status": "ready",
+        "workspace_id": WORKSPACE_ID,
+        "input": {
+            "title": f"Mock {aid}",
+            "additional_tracks": [
+                {
+                    "type": "subtitle",
+                    "language_code": lang,
+                    "name": lang.upper(),
+                    "url": f"{WORKSPACE_ID}/{aid}/origin-{aid}-subtitle-{lang}",
+                }
+                for lang in (subtitle_langs or [])
+            ],
+        },
+        "output": {
+            "format": "hls",
+            "playback_url": f"{base}/main.m3u8",
+            "thumbnail_url": [f"{base}/thumbnail-1-0.png?v=0"],
+            "preview_thumbnails_url": f"{base}/preview_thumbnails.vtt",
+        },
+    }
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -51,6 +82,7 @@ class Handler(BaseHTTPRequestHandler):
             aid = f"asset_{uuid.uuid4().hex[:8]}"
             tok = uuid.uuid4().hex
             UPLOADS[tok] = {"kind": "video", "asset_id": aid, "meta": body}
+            ASSETS[aid] = _ready_asset(aid)
             return self._json(200, {
                 "asset_id": aid,
                 "upload_url": f"{base}/put/{tok}",
@@ -68,18 +100,28 @@ class Handler(BaseHTTPRequestHandler):
 
         m = SUB_RE.match(self.path)
         if m:
+            aid = m.group("id")
             langs = body.get("language_codes") or []
             out = []
             for lang in langs:
                 tok = uuid.uuid4().hex
                 UPLOADS[tok] = {
                     "kind": "subtitle",
-                    "asset_id": m.group("id"),
+                    "asset_id": aid,
                     "language_code": lang,
                 }
                 out.append({
                     "language_code": lang,
                     "upload_url": f"{base}/put/{tok}",
+                })
+                # Mirror the uploaded subtitle into the asset record
+                # so GET /v1/video/assets/{id} reports it.
+                asset = ASSETS.setdefault(aid, _ready_asset(aid))
+                asset["input"]["additional_tracks"].append({
+                    "type": "subtitle",
+                    "language_code": lang,
+                    "name": lang.upper(),
+                    "url": f"{WORKSPACE_ID}/{aid}/origin-{aid}-subtitle-{lang}",
                 })
             # Match "single object" shape when only one language requested.
             return self._json(200, out[0] if len(out) == 1 else {"subtitles": out})
@@ -96,6 +138,15 @@ class Handler(BaseHTTPRequestHandler):
                 "asset_ids": body.get("asset_ids", []),
             })
 
+        return self._json(404, {"error": f"unknown path {self.path}"})
+
+    def do_GET(self) -> None:  # noqa: N802
+        m = ASSET_GET_RE.match(self.path)
+        if m:
+            asset = ASSETS.get(m.group("id"))
+            if asset is None:
+                return self._json(404, {"error": "unknown asset"})
+            return self._json(200, asset)
         return self._json(404, {"error": f"unknown path {self.path}"})
 
     def do_PUT(self) -> None:  # noqa: N802
